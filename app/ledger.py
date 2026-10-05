@@ -10,6 +10,20 @@
   报表落库后不可修改；关账后补录的旧业务流水按入账序号自然进入下一批次；
 - 同号同内容重试返回原结果，同号异内容拒绝（409）。
 
+净价更正（不改历史，独立流水）：
+- 财务凭全局唯一更正编号、原销售编号和非负新每册净价提交更正；
+- 按原销售阶梯费率与原销售入账时的分成版本，仅对更正时点各档未退册数计算
+  新旧净价的每册版税差额；逐作者差额 = 新净价下未退款总额分账 − 旧净价下
+  未退款总额分账（各自整额分账后相减，而非对差额分账）；
+- 更正以独立流水进入下一关账批次，不改写历史销售、退款、已关账报表和付款；
+- 同一销售可多次更正（链式），每笔相对上一生效净价（首笔相对原净价）；
+- 拒绝条件：销售不存在（404）、已全退、新价等于当前生效净价（400）；
+  同更正编号同内容重试返回原结果，异内容 409；
+- 此后退款仍按原销售末册、原每册计提、原分成版本冲回（原退款字段及金额不变），
+  对被退册数另记已生效价差的反向流水，与退款同事务同批次；全退后该销售
+  逐作者累计价差归零。旧退款不追溯；
+- 更正与退款、关账并发按提交顺序（数据库提交顺序）判定未退册数和批次归属。
+
 作者分成版本：
 - 作品的作者分成可随合作关系变化：创建作品时的分成为版本 1，之后按
   "作品编号 + 全局唯一变更编号 + 作者编号/比例"提交新版本，版本号按提交顺序递增；
@@ -40,7 +54,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from .db import LOCK, get_conn
-from .schemas import PaymentIn, RefundIn, SaleIn, SplitChangeIn, WorkIn
+from .schemas import CorrectionIn, PaymentIn, RefundIn, SaleIn, SplitChangeIn, WorkIn
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal(100)
@@ -129,6 +143,64 @@ def tier_segments(tiers: list[dict], cum_before: int, copies: int) -> list[dict]
                 }
             )
     return out
+
+
+def _largest_remainders(abs_weights: list[int], total: int) -> list[int]:
+    """最大余额法：在分母 total 下把 floor(w/total) 余分按余数大者优先补齐。
+
+    返回 floor 分摊，满足 sum(结果) == sum(abs_weights)//total。
+    余数相同按列序（调用方已保证列按作者编号顺序）。
+    """
+    base = [w // total for w in abs_weights]
+    spare = sum(abs_weights) // total - sum(base)
+    order = sorted(range(len(abs_weights)), key=lambda j: (-(abs_weights[j] % total), j))
+    for k in range(spare):
+        base[order[k % len(order)]] += 1
+    return base
+
+
+def _allocate_matrix(seg_diffs: list[int], author_diffs: list[int]) -> list[list[int]]:
+    """把逐档差额（行）按逐作者总差额（列）比例分摊为"档×作者"矩阵。
+
+    用于把更正的逐作者价差登记到分档池：后续退款按档回拨时，
+    某档退净即该档池清零，全退后逐作者累计价差严格归零。
+    行和 = seg_diffs、列和 = author_diffs。seg_diffs/author_diffs 同号
+    （允许 0）；末行承担全部舍入残差以保证列和精确。
+    """
+    n_rows, n_cols = len(seg_diffs), len(author_diffs)
+    matrix: list[list[int]] = [[0] * n_cols for _ in range(n_rows)]
+    total = sum(author_diffs)
+    if total == 0:
+        return matrix
+    sign = -1 if total < 0 else 1
+    abs_total, abs_cols = abs(total), [abs(v) for v in author_diffs]
+    for i in range(n_rows):
+        if i == n_rows - 1:
+            for j in range(n_cols):  # 末行兜底，列和严格等于 author_diffs
+                matrix[i][j] = author_diffs[j] - sum(matrix[r][j] for r in range(i))
+            continue
+        row_abs = abs(seg_diffs[i])
+        cols = _largest_remainders([row_abs * c for c in abs_cols], abs_total)
+        for j in range(n_cols):
+            matrix[i][j] = sign * cols[j]
+    return matrix
+
+
+def _allocate_pool_draw(pool: list[int], take: int, units: int) -> list[int]:
+    """分档部分退款时，从该档各作者价差池按占比回拨（最大余额法）。
+
+    pool 为该档各作者未反向价差（同号，列按作者编号顺序），units 为回拨前
+    未退册数，take 为本次被退册数。整档退净时直接回拨整池（精确清零）。
+    返回各作者本次回拨额（与池同号）。
+    """
+    if take == units:
+        return list(pool)
+    total = sum(pool)
+    if total == 0:
+        return [0] * len(pool)
+    sign = -1 if total < 0 else 1
+    drawn = _largest_remainders([abs(v) * take for v in pool], units)
+    return [sign * v for v in drawn]
 
 
 # ---------------------------------------------------------------- 作品
@@ -411,6 +483,21 @@ def sale_response(conn: sqlite3.Connection, sale_id: str) -> dict:
     splits = conn.execute(
         "SELECT author_id, amount_cents FROM sale_splits WHERE sale_id=?", (sale_id,)
     ).fetchall()
+    corrections = [
+        {
+            "correction_id": r["correction_id"],
+            "entry_seq": r["entry_seq"],
+            "old_net_price": r["old_net_price"],
+            "new_net_price": r["new_net_price"],
+            "total_diff_cents": r["total_diff_cents"],
+            "close_id": r["close_id"],
+            "created_at": r["created_at"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM corrections WHERE sale_id=? ORDER BY entry_seq", (sale_id,)
+        )
+    ]
+    current_price = corrections[-1]["new_net_price"] if corrections else s["net_price"]
     return {
         "type": "sale",
         "sale_id": s["sale_id"],
@@ -418,6 +505,7 @@ def sale_response(conn: sqlite3.Connection, sale_id: str) -> dict:
         "business_time": s["business_time"],
         "copies": s["copies"],
         "net_price": s["net_price"],
+        "current_net_price": current_price,
         "entry_seq": s["entry_seq"],
         "cum_before": s["cum_before"],
         "cum_after": s["cum_after"],
@@ -440,6 +528,7 @@ def sale_response(conn: sqlite3.Connection, sale_id: str) -> dict:
             for x in sorted(splits, key=lambda x: author_order_key(x["author_id"]))
         ],
         "refunded_copies": sum(g["refunded_copies"] for g in segs),
+        "price_corrections": corrections,
         "close_id": s["close_id"],
         "created_at": s["created_at"],
     }
@@ -526,6 +615,44 @@ def _refund_fingerprint(p: RefundIn) -> str:
     )
 
 
+def _reversal_response(conn: sqlite3.Connection, refund_id: str) -> dict | None:
+    """退款对应的已生效价差反向流水（原销售无更正时为 None）。"""
+    v = conn.execute(
+        "SELECT * FROM refund_diff_reversals WHERE refund_id=?", (refund_id,)
+    ).fetchone()
+    if v is None:
+        return None
+    segs = conn.execute(
+        "SELECT * FROM refund_diff_reversal_segments WHERE refund_id=? ORDER BY idx",
+        (refund_id,),
+    ).fetchall()
+    splits = conn.execute(
+        "SELECT author_id, amount_cents FROM refund_diff_reversal_splits WHERE refund_id=?",
+        (refund_id,),
+    ).fetchall()
+    return {
+        "refund_id": refund_id,
+        "entry_seq": v["entry_seq"],
+        "sale_id": v["sale_id"],
+        "total_diff_cents": v["total_diff_cents"],
+        "segments": [
+            {
+                "segment_index": g["idx"],
+                "sale_segment_index": g["sale_segment_idx"],
+                "copies": g["copies"],
+                "diff_cents": g["diff_cents"],
+            }
+            for g in segs
+        ],
+        "splits": [
+            {"author_id": x["author_id"], "amount_cents": x["amount_cents"]}
+            for x in sorted(splits, key=lambda x: author_order_key(x["author_id"]))
+        ],
+        "close_id": v["close_id"],
+        "created_at": v["created_at"],
+    }
+
+
 def refund_response(conn: sqlite3.Connection, refund_id: str) -> dict:
     r = conn.execute("SELECT * FROM refunds WHERE refund_id=?", (refund_id,)).fetchone()
     if r is None:
@@ -568,6 +695,8 @@ def refund_response(conn: sqlite3.Connection, refund_id: str) -> dict:
             {"author_id": x["author_id"], "amount_cents": x["amount_cents"]}
             for x in sorted(splits, key=lambda x: author_order_key(x["author_id"]))
         ],
+        # 被退册数已生效价差的反向流水（随本退款同批次；销售无更正时为 null）
+        "price_diff_reversal": _reversal_response(conn, refund_id),
         "close_id": r["close_id"],
         "created_at": r["created_at"],
     }
@@ -641,6 +770,60 @@ def record_refund(p: RefundIn) -> tuple[dict, bool]:
                     " VALUES(?,?,?)",
                     (p.refund_id, aid, amt),
                 )
+
+            # 被退册数另记已生效价差的反向流水：原销售曾有更正才产生，
+            # 与退款同一事务、入账序号相邻，必随退款归入同一关账批次。
+            # 旧退款（更正之前）不追溯；原退款字段及金额保持不变。
+            author_ids = [a["author_id"] for a in authors]
+            rev_seg_rows: list[tuple[int, int, int]] = []  # (sale_segment_idx, take, diff)
+            rev_split_map: dict[str, int] = {aid: 0 for aid in author_ids}
+            has_correction = conn.execute(
+                "SELECT 1 FROM corrections WHERE sale_id=? LIMIT 1", (p.sale_id,)
+            ).fetchone()
+            if has_correction:
+                # 各档被退前的未退册数（refunded_copies 尚未写入本笔）
+                units = {seg["idx"]: seg["copies"] - seg["refunded_copies"] for seg in segs}
+                for seg, take in portions:
+                    pool_rows = conn.execute(
+                        "SELECT author_id, amount_cents FROM correction_segment_pools"
+                        " WHERE sale_id=? AND segment_idx=?",
+                        (p.sale_id, seg["idx"]),
+                    ).fetchall()
+                    pool_map = {r["author_id"]: r["amount_cents"] for r in pool_rows}
+                    pool = [pool_map.get(aid, 0) for aid in author_ids]
+                    drawn = _allocate_pool_draw(pool, take, units[seg["idx"]])
+                    seg_diff = sum(drawn)  # 与已生效价差同号；反向流水记其相反数
+                    rev_seg_rows.append((seg["idx"], take, -seg_diff))
+                    for aid, v in zip(author_ids, drawn):
+                        rev_split_map[aid] -= v
+                        conn.execute(
+                            "UPDATE correction_segment_pools SET amount_cents=amount_cents-?"
+                            " WHERE sale_id=? AND segment_idx=? AND author_id=?",
+                            (v, p.sale_id, seg["idx"], aid),
+                        )
+                rev_total = sum(d for _, _, d in rev_seg_rows)
+                rev_entry = conn.execute(
+                    "INSERT INTO entries(kind, ref_id) VALUES('price_diff_reversal', ?)",
+                    (p.refund_id,),
+                ).lastrowid
+                now = _utcnow()
+                conn.execute(
+                    "INSERT INTO refund_diff_reversals(refund_id, sale_id, entry_seq,"
+                    " total_diff_cents, created_at) VALUES(?,?,?,?,?)",
+                    (p.refund_id, p.sale_id, rev_entry, rev_total, now),
+                )
+                for idx, (seg_idx, take, diff) in enumerate(rev_seg_rows):
+                    conn.execute(
+                        "INSERT INTO refund_diff_reversal_segments(refund_id, idx,"
+                        " sale_segment_idx, copies, diff_cents) VALUES(?,?,?,?,?)",
+                        (p.refund_id, idx, seg_idx, take, diff),
+                    )
+                for aid in author_ids:
+                    conn.execute(
+                        "INSERT INTO refund_diff_reversal_splits(refund_id, author_id,"
+                        " amount_cents) VALUES(?,?,?)",
+                        (p.refund_id, aid, rev_split_map[aid]),
+                    )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -651,6 +834,199 @@ def record_refund(p: RefundIn) -> tuple[dict, bool]:
 def get_refund(refund_id: str) -> dict:
     with LOCK:
         return refund_response(get_conn(), refund_id)
+
+
+# ---------------------------------------------------------------- 净价更正
+
+
+def _correction_fingerprint(p: CorrectionIn) -> str:
+    return _fingerprint(
+        {
+            "correction_id": p.correction_id,
+            "sale_id": p.sale_id,
+            "new_net_price": dec_str(p.new_net_price),
+        }
+    )
+
+
+def correction_response(conn: sqlite3.Connection, correction_id: str) -> dict:
+    c = conn.execute(
+        "SELECT * FROM corrections WHERE correction_id=?", (correction_id,)
+    ).fetchone()
+    if c is None:
+        raise _not_found(f"净价更正 {correction_id} 不存在")
+    segs = conn.execute(
+        "SELECT * FROM correction_segments WHERE correction_id=? ORDER BY idx",
+        (correction_id,),
+    ).fetchall()
+    splits = conn.execute(
+        "SELECT author_id, amount_cents FROM correction_splits WHERE correction_id=?",
+        (correction_id,),
+    ).fetchall()
+    return {
+        "type": "correction",
+        "correction_id": c["correction_id"],
+        "sale_id": c["sale_id"],
+        "entry_seq": c["entry_seq"],
+        "old_net_price": c["old_net_price"],
+        "new_net_price": c["new_net_price"],
+        "split_version": c["split_version"],
+        "segments": [
+            {
+                "segment_index": g["idx"],
+                "sale_segment_index": g["sale_segment_idx"],
+                "tier_index": g["tier_idx"],
+                "rate": g["rate"],
+                "copies": g["copies"],
+                "old_per_copy_royalty_cents": g["old_per_copy_cents"],
+                "new_per_copy_royalty_cents": g["new_per_copy_cents"],
+                "diff_cents": g["diff_cents"],
+            }
+            for g in segs
+        ],
+        "old_total_royalty_cents": c["old_total_cents"],
+        "new_total_royalty_cents": c["new_total_cents"],
+        "total_diff_cents": c["total_diff_cents"],
+        "splits": [
+            {"author_id": x["author_id"], "diff_cents": x["amount_cents"]}
+            for x in sorted(splits, key=lambda x: author_order_key(x["author_id"]))
+        ],
+        "close_id": c["close_id"],
+        "created_at": c["created_at"],
+    }
+
+
+def submit_correction(p: CorrectionIn) -> tuple[dict, bool]:
+    """提交销售净价更正。返回 (更正结果, 是否新建)。"""
+    fp = _correction_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        # 幂等优先：同更正编号同内容重试返回原结果（异内容 409，编号全局唯一）
+        row = conn.execute(
+            "SELECT fingerprint FROM corrections WHERE correction_id=?",
+            (p.correction_id,),
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fp:
+                raise _conflict(f"更正编号 {p.correction_id} 已存在且内容不一致")
+            return correction_response(conn, p.correction_id), False
+        sale = conn.execute(
+            "SELECT * FROM sales WHERE sale_id=?", (p.sale_id,)
+        ).fetchone()
+        if sale is None:
+            raise _not_found(f"原销售 {p.sale_id} 不存在")
+        # 差额一律按原销售入账时的分成版本分账（与当前版本无关）
+        authors = _version_authors(conn, sale["work_id"], sale["split_version"])
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            segs = conn.execute(
+                "SELECT * FROM sale_segments WHERE sale_id=? ORDER BY idx", (p.sale_id,)
+            ).fetchall()
+            active = [(g, g["copies"] - g["refunded_copies"]) for g in segs]
+            active = [(g, n) for g, n in active if n > 0]
+            if not active:  # 已全退：无可更正的未退册数
+                raise _bad_request(f"原销售 {p.sale_id} 已全退，不能更正净价")
+            # 当前生效净价：上一笔更正的新价；无则原销售净价
+            latest = conn.execute(
+                "SELECT new_net_price FROM corrections WHERE sale_id=?"
+                " ORDER BY entry_seq DESC LIMIT 1",
+                (p.sale_id,),
+            ).fetchone()
+            old_price_str = latest["new_net_price"] if latest else sale["net_price"]
+            old_price = Decimal(old_price_str)
+            if p.new_net_price == old_price:
+                raise _bad_request("新每册净价与当前生效净价相同，无需更正")
+            new_price = p.new_net_price
+
+            seg_rows = []
+            seg_diffs = []
+            old_total = new_total = 0
+            for g, n in active:
+                rate = Decimal(g["rate"])
+                old_ppc = per_copy_cents(old_price, rate)
+                new_ppc = per_copy_cents(new_price, rate)
+                old_amt = old_ppc * n
+                new_amt = new_ppc * n
+                old_total += old_amt
+                new_total += new_amt
+                diff = new_amt - old_amt
+                seg_diffs.append(diff)
+                seg_rows.append(
+                    (g["idx"], g["tier_idx"], g["rate"], n, old_ppc, new_ppc, diff)
+                )
+            # 逐作者差额：两种净价下未退款总额分别整额分账后相减
+            old_split = dict(split_cents(old_total, authors))
+            new_split = dict(split_cents(new_total, authors))
+            author_ids = [a["author_id"] for a in authors]
+            author_diffs = [new_split[a] - old_split[a] for a in author_ids]
+            total_diff = new_total - old_total
+            assert total_diff == sum(seg_diffs) == sum(author_diffs)
+
+            # 把逐作者差额按各档差额分摊到分档池，供后续退款按档精确反向
+            matrix = _allocate_matrix(seg_diffs, author_diffs)
+
+            entry_seq = conn.execute(
+                "INSERT INTO entries(kind, ref_id) VALUES('correction', ?)",
+                (p.correction_id,),
+            ).lastrowid
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO corrections(correction_id, sale_id, old_net_price,"
+                " new_net_price, entry_seq, split_version, old_total_cents,"
+                " new_total_cents, total_diff_cents, fingerprint, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    p.correction_id,
+                    p.sale_id,
+                    dec_str(old_price),
+                    dec_str(new_price),
+                    entry_seq,
+                    sale["split_version"],
+                    old_total,
+                    new_total,
+                    total_diff,
+                    fp,
+                    now,
+                ),
+            )
+            for idx, (seg_idx, tier_idx, rate_str, n, old_ppc, new_ppc, diff) in enumerate(
+                seg_rows
+            ):
+                conn.execute(
+                    "INSERT INTO correction_segments(correction_id, idx, sale_segment_idx,"
+                    " tier_idx, rate, copies, old_per_copy_cents, new_per_copy_cents,"
+                    " diff_cents) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        p.correction_id, idx, seg_idx, tier_idx, rate_str, n,
+                        old_ppc, new_ppc, diff,
+                    ),
+                )
+            for j, aid in enumerate(author_ids):
+                conn.execute(
+                    "INSERT INTO correction_splits(correction_id, author_id, amount_cents)"
+                    " VALUES(?,?,?)",
+                    (p.correction_id, aid, author_diffs[j]),
+                )
+                for i in range(len(seg_rows)):
+                    if matrix[i][j] == 0:
+                        continue
+                    conn.execute(
+                        "INSERT INTO correction_segment_pools(sale_id, segment_idx,"
+                        " author_id, amount_cents) VALUES(?,?,?,?)"
+                        " ON CONFLICT(sale_id, segment_idx, author_id)"
+                        " DO UPDATE SET amount_cents=amount_cents+excluded.amount_cents",
+                        (p.sale_id, seg_rows[i][0], aid, matrix[i][j]),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return correction_response(conn, p.correction_id), True
+
+
+def get_correction(correction_id: str) -> dict:
+    with LOCK:
+        return correction_response(get_conn(), correction_id)
 
 
 # ---------------------------------------------------------------- 关账
@@ -689,9 +1065,22 @@ def close_batch(request_id: str | None) -> tuple[dict, bool]:
                 if e["kind"] == "sale":
                     payload = sale_response(conn, e["ref_id"])
                     sign = 1
-                else:
+                    split_key = "amount_cents"
+                elif e["kind"] == "refund":
                     payload = refund_response(conn, e["ref_id"])
-                    sign = -1
+                    sign = -1  # 原退款冲回：取退款自身 splits 的相反数
+                    split_key = "amount_cents"
+                elif e["kind"] == "correction":
+                    payload = correction_response(conn, e["ref_id"])
+                    sign = 1  # 更正差额带符号，splits 中字段名为 diff_cents
+                    split_key = "diff_cents"
+                else:  # price_diff_reversal：价差反向流水，金额已带符号（与价差相反）
+                    payload = {
+                        "type": "price_diff_reversal",
+                        **_reversal_response(conn, e["ref_id"]),
+                    }
+                    sign = 1
+                    split_key = "amount_cents"
                 payload["close_id"] = close_id
                 conn.execute(
                     "INSERT INTO close_lines(close_id, entry_seq, line_type, ref_id, payload)"
@@ -701,7 +1090,7 @@ def close_batch(request_id: str | None) -> tuple[dict, bool]:
                 )
                 for s in payload["splits"]:
                     totals[s["author_id"]] = (
-                        totals.get(s["author_id"], 0) + sign * s["amount_cents"]
+                        totals.get(s["author_id"], 0) + sign * s[split_key]
                     )
             for aid, amt in totals.items():
                 conn.execute(
@@ -715,6 +1104,14 @@ def close_batch(request_id: str | None) -> tuple[dict, bool]:
             )
             conn.execute(
                 "UPDATE refunds SET close_id=? WHERE entry_seq>? AND entry_seq<=?",
+                (close_id, prev, cur_seq),
+            )
+            conn.execute(
+                "UPDATE corrections SET close_id=? WHERE entry_seq>? AND entry_seq<=?",
+                (close_id, prev, cur_seq),
+            )
+            conn.execute(
+                "UPDATE refund_diff_reversals SET close_id=? WHERE entry_seq>? AND entry_seq<=?",
                 (close_id, prev, cur_seq),
             )
             conn.commit()
@@ -741,6 +1138,12 @@ def _close_report(conn: sqlite3.Connection, close_id: int) -> dict:
     ).fetchall()
     sales_total = sum(l["total_royalty_cents"] for l in lines if l["type"] == "sale")
     refund_total = sum(l["total_refund_cents"] for l in lines if l["type"] == "refund")
+    correction_total = sum(
+        l["total_diff_cents"] for l in lines if l["type"] == "correction"
+    )
+    reversal_total = sum(
+        l["total_diff_cents"] for l in lines if l["type"] == "price_diff_reversal"
+    )
     return {
         "close_id": c["close_id"],
         "request_id": c["request_id"],
@@ -749,6 +1152,10 @@ def _close_report(conn: sqlite3.Connection, close_id: int) -> dict:
         "entry_seq_to": c["last_entry_seq"],
         "sales_count": sum(1 for l in lines if l["type"] == "sale"),
         "refunds_count": sum(1 for l in lines if l["type"] == "refund"),
+        "corrections_count": sum(1 for l in lines if l["type"] == "correction"),
+        "diff_reversals_count": sum(
+            1 for l in lines if l["type"] == "price_diff_reversal"
+        ),
         "lines": lines,
         "author_totals": [
             {"author_id": t["author_id"], "amount_cents": t["amount_cents"]}
@@ -756,7 +1163,11 @@ def _close_report(conn: sqlite3.Connection, close_id: int) -> dict:
         ],
         "total_sales_royalty_cents": sales_total,
         "total_refund_cents": refund_total,
-        "net_royalty_cents": sales_total - refund_total,
+        "total_price_correction_cents": correction_total,
+        "total_price_diff_reversal_cents": reversal_total,
+        # 净额 = 销售计提 − 原退款冲回 ± 净价更正 ± 退款价差反向
+        "net_royalty_cents": sales_total - refund_total
+        + correction_total + reversal_total,
     }
 
 

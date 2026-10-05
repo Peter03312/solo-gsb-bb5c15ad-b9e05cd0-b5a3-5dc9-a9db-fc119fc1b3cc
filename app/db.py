@@ -49,10 +49,12 @@ CREATE TABLE IF NOT EXISTS work_version_authors (
     FOREIGN KEY (work_id, version) REFERENCES work_versions(work_id, version)
 );
 
--- 全局入账序号：销售与退款统一排队，决定累计册数与关账批次归属
+-- 全局入账序号：销售、退款、净价更正、退款价差反向流水统一排队，
+-- 决定累计册数与关账批次归属（提交顺序即数据库提交顺序）
 CREATE TABLE IF NOT EXISTS entries (
     entry_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind      TEXT NOT NULL CHECK (kind IN ('sale', 'refund')),
+    kind      TEXT NOT NULL CHECK (kind IN
+                  ('sale', 'refund', 'correction', 'price_diff_reversal')),
     ref_id    TEXT NOT NULL
 );
 
@@ -114,6 +116,79 @@ CREATE TABLE IF NOT EXISTS refund_segments (
 );
 CREATE TABLE IF NOT EXISTS refund_splits (
     refund_id    TEXT NOT NULL REFERENCES refunds(refund_id),
+    author_id    TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    PRIMARY KEY (refund_id, author_id)
+);
+
+-- 净价更正：以全局唯一更正编号提交，只计算更正时点各档未退册数的新旧净价差额。
+-- 更正以独立流水进入下一关账批次，不改写历史销售/退款/已关账报表/付款；
+-- 同一销售可多次更正，每笔相对上一生效净价（首笔相对原净价）。
+CREATE TABLE IF NOT EXISTS corrections (
+    correction_id       TEXT PRIMARY KEY,
+    sale_id             TEXT NOT NULL REFERENCES sales(sale_id),
+    old_net_price       TEXT NOT NULL,  -- 更正前生效净价（元）：上一笔更正的新价或原净价
+    new_net_price       TEXT NOT NULL,  -- 非负新每册净价（元）
+    entry_seq           INTEGER NOT NULL UNIQUE REFERENCES entries(entry_seq),
+    split_version       INTEGER NOT NULL,  -- 原销售入账时的分成版本（差额据此分账）
+    old_total_cents     INTEGER NOT NULL,  -- 旧净价下未退册数的应计总额（分）
+    new_total_cents     INTEGER NOT NULL,  -- 新净价下未退册数的应计总额（分）
+    total_diff_cents    INTEGER NOT NULL,  -- 各档差额合计（正为补提、负为冲减）
+    close_id            INTEGER REFERENCES closes(close_id),
+    fingerprint         TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_corrections_sale ON corrections(sale_id);
+
+CREATE TABLE IF NOT EXISTS correction_segments (
+    correction_id    TEXT NOT NULL REFERENCES corrections(correction_id),
+    idx              INTEGER NOT NULL,
+    sale_segment_idx INTEGER NOT NULL,
+    tier_idx         INTEGER NOT NULL,
+    rate             TEXT NOT NULL,
+    copies           INTEGER NOT NULL,  -- 更正时点该档未退册数
+    old_per_copy_cents INTEGER NOT NULL,
+    new_per_copy_cents INTEGER NOT NULL,
+    diff_cents       INTEGER NOT NULL,
+    PRIMARY KEY (correction_id, idx)
+);
+CREATE TABLE IF NOT EXISTS correction_splits (
+    correction_id TEXT NOT NULL REFERENCES corrections(correction_id),
+    author_id     TEXT NOT NULL,
+    amount_cents  INTEGER NOT NULL,
+    PRIMARY KEY (correction_id, author_id)
+);
+-- 价差池：每笔更正把逐作者价差分摊到各销售分档；退款按档回拨，
+-- 某档退净时该档池为 0，全退后该销售逐作者累计价差严格归零
+CREATE TABLE IF NOT EXISTS correction_segment_pools (
+    sale_id      TEXT NOT NULL REFERENCES sales(sale_id),
+    segment_idx  INTEGER NOT NULL,
+    author_id    TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,  -- 已生效未反向的价差（带符号）
+    PRIMARY KEY (sale_id, segment_idx, author_id)
+);
+
+-- 退款价差反向流水：对退款册数另记已生效价差的反向流水，
+-- 与退款同事务、入账序号相邻，随退款归入同一关账批次。
+-- 仅当原销售曾有生效更正时产生；金额按价差池回拨，旧退款不追溯。
+CREATE TABLE IF NOT EXISTS refund_diff_reversals (
+    refund_id        TEXT PRIMARY KEY REFERENCES refunds(refund_id),
+    sale_id          TEXT NOT NULL REFERENCES sales(sale_id),
+    entry_seq        INTEGER NOT NULL UNIQUE REFERENCES entries(entry_seq),
+    total_diff_cents INTEGER NOT NULL,  -- 带符号：与已生效价差相反
+    close_id         INTEGER REFERENCES closes(close_id),
+    created_at       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refund_diff_reversal_segments (
+    refund_id        TEXT NOT NULL REFERENCES refund_diff_reversals(refund_id),
+    idx              INTEGER NOT NULL,
+    sale_segment_idx INTEGER NOT NULL,
+    copies           INTEGER NOT NULL,
+    diff_cents       INTEGER NOT NULL,
+    PRIMARY KEY (refund_id, idx)
+);
+CREATE TABLE IF NOT EXISTS refund_diff_reversal_splits (
+    refund_id    TEXT NOT NULL REFERENCES refund_diff_reversals(refund_id),
     author_id    TEXT NOT NULL,
     amount_cents INTEGER NOT NULL,
     PRIMARY KEY (refund_id, author_id)
@@ -195,13 +270,57 @@ def init_db() -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧库迁移（幂等）：为 sales 补 split_version 列；把旧 work_authors 表迁为版本 1。"""
+    """旧库迁移（幂等）。
+
+    - 为 sales 补 split_version 列；把旧 work_authors 表迁为版本 1；
+    - 旧库 entries 的 CHECK 仅允许 ('sale','refund')，重建表放开
+      'correction' 与 'price_diff_reversal' 两类净价更正相关流水。
+    """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales)")}
     if "split_version" not in cols:
         # 版本机制之前的销售均按初始分成计提，回填版本 1
         conn.execute(
             "ALTER TABLE sales ADD COLUMN split_version INTEGER NOT NULL DEFAULT 1"
         )
+    # 净价更正在旧库为新表（CREATE IF NOT EXISTS 自动建），仅需为极少数
+    # 开发期中间态库补列；正常旧库无 corrections 表，直接跳过。
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corrections'"
+    ).fetchone():
+        ccols = {r["name"] for r in conn.execute("PRAGMA table_info(corrections)")}
+        if "old_total_cents" not in ccols:
+            conn.execute(
+                "ALTER TABLE corrections ADD COLUMN old_total_cents INTEGER NOT NULL DEFAULT 0"
+            )
+        if "new_total_cents" not in ccols:
+            conn.execute(
+                "ALTER TABLE corrections ADD COLUMN new_total_cents INTEGER NOT NULL DEFAULT 0"
+            )
+    # 旧库 entries 约束不含新流水类型：按 SQLite 官方步骤重建表（保留原序号）。
+    # 重建父表须先关闭外键强制（sales/refunds 均以 entry_seq 引用 entries）。
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='entries'"
+    ).fetchone()["sql"]
+    if "price_diff_reversal" not in ddl:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.executescript(
+            """
+            CREATE TABLE entries_new (
+                entry_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind      TEXT NOT NULL CHECK (kind IN
+                              ('sale', 'refund', 'correction', 'price_diff_reversal')),
+                ref_id    TEXT NOT NULL
+            );
+            INSERT INTO entries_new(entry_seq, kind, ref_id)
+                SELECT entry_seq, kind, ref_id FROM entries;
+            DROP TABLE entries;
+            ALTER TABLE entries_new RENAME TO entries;
+            """
+        )
+        conn.execute("PRAGMA foreign_keys=ON")
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:  # 迁移后存在悬挂引用则报错，不静默吞掉
+            raise RuntimeError(f"entries 迁移后外键检查失败: {bad!r}")
     has_legacy = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_authors'"
     ).fetchone()

@@ -115,3 +115,39 @@ curl -s -X POST "$BASE/closes" -H 'Content-Type: application/json' -d '{
 }' | fmt
 curl -s "$BASE/authors/A2/settlement" | fmt
 curl -s "$BASE/authors/A3/settlement" | fmt
+
+echo "== 15. 净价更正：凭全局唯一更正编号、原销售编号、非负新每册净价提交 =="
+# S100 共 1200 册，此前已退 250+10=260 册；更正只对未退 940 册计差额：
+#   8% 档未退 1000-60=940 册（33.33*0.08=2.6664→267 分；40*0.08=3.20→320 分，+53/册）
+#   10% 档 200 册此前已全退，不计；差额按原销售入账时分成版本（v1：A1 60/A2 40）
+#   两种净价下未退款总额分别整额分账后相减
+curl -s -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d '{
+  "correction_id": "COR-2026-10-001",
+  "sale_id": "S100",
+  "new_net_price": 40.00
+}' | fmt
+
+echo "== 16. 按更正编号查询；销售详情展示当前生效净价与历次更正（原净价字段不变）=="
+curl -s "$BASE/corrections/COR-2026-10-001" | fmt
+curl -s "$BASE/sales/S100" | fmt
+
+echo "== 17. 同更正编号同内容重试返回原结果（200），异内容冲突（409）=="
+curl -s -o /dev/null -w 'replay http=%{http_code}\n' -X POST "$BASE/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"correction_id":"COR-2026-10-001","sale_id":"S100","new_net_price":40.00}'
+curl -s -o /dev/null -w 'conflict http=%{http_code}\n' -X POST "$BASE/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"correction_id":"COR-2026-10-001","sale_id":"S100","new_net_price":41.00}'
+
+echo "== 18. 更正后退款：原退款仍按末册、原价、原版本冲回（字段金额不变）；=="
+echo "    另对被退册数记已生效价差的反向流水（price_diff_reversal），随退款同批关账。"
+curl -s -X POST "$BASE/refunds" -H 'Content-Type: application/json' -d '{
+  "refund_id": "RF102",
+  "sale_id": "S100",
+  "copies": 40
+}' | fmt
+
+echo "== 19. 关账：更正（correction）与价差反向（price_diff_reversal）各为独立行进入本批 =="
+curl -s -X POST "$BASE/closes" -H 'Content-Type: application/json' -d '{
+  "request_id": "CLOSE-2026-10-COR"
+}' | fmt
