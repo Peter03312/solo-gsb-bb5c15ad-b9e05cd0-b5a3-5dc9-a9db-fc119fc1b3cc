@@ -9,7 +9,15 @@ from fastapi.responses import JSONResponse
 from . import ledger
 from .db import init_db
 from .ledger import ApiError
-from .schemas import CloseIn, PaymentIn, RefundIn, SaleIn, SplitChangeIn, WorkIn
+from .schemas import (
+    CloseIn,
+    PaymentIn,
+    PriceCorrectionIn,
+    RefundIn,
+    SaleIn,
+    SplitChangeIn,
+    WorkIn,
+)
 
 
 @asynccontextmanager
@@ -20,8 +28,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.2.0",
-    description="阶梯版税计提、作者分成版本、退款冲销、关账报表与关账后付款结算",
+    version="1.3.0",
+    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表与关账后付款结算",
     lifespan=lifespan,
 )
 
@@ -33,7 +41,7 @@ async def api_error_handler(request, exc: ApiError):
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.2.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.3.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -117,6 +125,31 @@ def create_refund(payload: RefundIn, response: Response):
 @app.get("/refunds/{refund_id}", summary="查询退款流水及冲销明细")
 def get_refund(refund_id: str):
     return ledger.get_refund(refund_id)
+
+
+# ---------------------------------------------------------------- 净价更正
+
+
+@app.post(
+    "/price-corrections",
+    status_code=201,
+    summary="提交销售净价更正（仅对未退册数补提/冲回版税差额）",
+)
+def create_price_correction(payload: PriceCorrectionIn, response: Response):
+    body, created = ledger.submit_price_correction(payload)
+    if not created:  # 同更正编号同内容重试 → 返回原结果
+        response.status_code = 200
+    return body
+
+
+@app.get("/price-corrections", summary="查询净价更正列表（可按 sale_id 过滤）")
+def list_price_corrections(sale_id: str | None = None):
+    return ledger.list_price_corrections(sale_id)
+
+
+@app.get("/price-corrections/{correction_id}", summary="按更正编号查询净价更正")
+def get_price_correction(correction_id: str):
+    return ledger.get_price_correction(correction_id)
 
 
 # ---------------------------------------------------------------- 关账

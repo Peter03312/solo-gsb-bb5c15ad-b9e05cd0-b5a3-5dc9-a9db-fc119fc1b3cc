@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -40,6 +41,13 @@ def make_sale(client, sale_id, work_id="W1", copies=1, price="33.33", ts="2026-0
             "copies": copies,
             "net_price": price,
         },
+    )
+
+
+def correct_price(client, correction_id, sale_id, new_price):
+    return client.post(
+        "/price-corrections",
+        json={"correction_id": correction_id, "sale_id": sale_id, "new_net_price": new_price},
     )
 
 
@@ -743,3 +751,333 @@ def test_migration_from_legacy_schema(tmp_path):
         s = make_sale(client, "S2", copies=1, price="10.00").json()
         assert s["split_version"] == 2
         assert s["splits"] == [{"author_id": "A1", "amount_cents": 80}]
+
+
+# ---------------------------------------------------------------- 销售净价更正
+
+
+def test_price_correction_tier_delta_and_author_split(client):
+    """各档未退册数的新旧每册版税差额；逐作者为两个未退总额独立分账后相减。"""
+    make_work(client)
+    make_sale(client, "S1", copies=800)
+    make_sale(client, "S2", copies=400)  # 800→1000 档 200 册@267；1000→1200 档 200 册@333
+    # 先退 250 册（200@333 + 50@267）：剩余 950 册全在 0 档
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S2", "copies": 250})
+
+    r = correct_price(client, "PC1", "S2", 40)  # 0.08 档 ppc 267→320（+53）
+    assert r.status_code == 201
+    b = r.json()
+    assert b["type"] == "price_correction"
+    assert b["sale_id"] == "S2" and b["sale_entry_seq"] == 2
+    assert b["split_version"] == 1  # 原销售入账时的分成版本
+    assert b["entry_seq"] == 4  # S1=1, S2=2, R1=3, PC1=4
+    assert b["segments"] == [
+        {
+            "segment_index": 0,
+            "sale_segment_index": 0,
+            "tier_index": 0,
+            "rate": "0.08",
+            "unrefunded_copies": 150,
+            "old_per_copy_royalty_cents": 267,
+            "new_per_copy_royalty_cents": 320,
+            "delta_per_copy_cents": 53,
+            "amount_cents": 150 * 53,
+        }
+    ]
+    assert b["total_delta_cents"] == 150 * 53
+    assert b["splits"] == [
+        {"author_id": "A1", "amount_cents": int(150 * 53 * 0.6)},
+        {"author_id": "A2", "amount_cents": int(150 * 53 * 0.4)},
+    ]
+    assert b["close_id"] is None
+
+
+def test_price_correction_multi_tier(client):
+    """未退款销售跨档更正：逐档分别计算新旧每册版税差额。"""
+    make_work(client)
+    make_sale(client, "S1", copies=1200)  # 1000@267 + 200@333
+    r = correct_price(client, "PC1", "S1", 40)  # 320（+53）/ 400（+67）
+    assert r.status_code == 201
+    b = r.json()
+    assert [(s["tier_index"], s["unrefunded_copies"], s["delta_per_copy_cents"])
+            for s in b["segments"]] == [(0, 1000, 53), (1, 200, 67)]
+    total = 1000 * 53 + 200 * 67
+    assert b["total_delta_cents"] == total
+    assert b["splits"] == [
+        {"author_id": "A1", "amount_cents": 39840},
+        {"author_id": "A2", "amount_cents": 26560},
+    ]
+
+
+def test_price_correction_negative_delta(client):
+    """降价更正产生负差额；退款反向流水同号冲回。"""
+    make_work(client)
+    make_sale(client, "S1", copies=1200)
+    # 33.33→25：0.08 档 267→200（−67）；0.10 档 333→250（−83）
+    r = correct_price(client, "PC1", "S1", 25)
+    assert r.status_code == 201
+    b = r.json()
+    assert b["total_delta_cents"] == 1000 * -67 + 200 * -83
+    assert b["splits"] == [
+        {"author_id": "A1", "amount_cents": -50160},
+        {"author_id": "A2", "amount_cents": -33440},
+    ]
+    # 退 200 册（全部 10% 档）：反向流水每册 −83，带负号
+    r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 200})
+    rev = r.json()["price_delta_reversal"]
+    assert rev["total_reversal_cents"] == 200 * -83
+    assert rev["splits"] == [
+        {"author_id": "A1", "amount_cents": -9960},
+        {"author_id": "A2", "amount_cents": -6640},
+    ]
+
+
+def test_price_correction_idempotency_conflict_and_gates(client):
+    make_work(client)
+    make_sale(client, "S1", copies=10)
+    r1 = correct_price(client, "PC1", "S1", 40)
+    assert r1.status_code == 201
+    # 同号同内容重试 → 原结果
+    r2 = correct_price(client, "PC1", "S1", 40)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    # 同号异内容 → 409
+    assert correct_price(client, "PC1", "S1", 41).status_code == 409
+    # 新价等于当前更正价 → 409
+    assert correct_price(client, "PC2", "S1", 40).status_code == 409
+    # 更正编号全局唯一：跨销售复用 → 409
+    make_sale(client, "S2", copies=10)
+    assert correct_price(client, "PC1", "S2", 40).status_code == 409
+    # 销售不存在 → 404
+    assert correct_price(client, "PC9", "NOPE", 40).status_code == 404
+    # 新价为负 → 422
+    assert correct_price(client, "PC8", "S1", -1).status_code == 422
+
+
+def test_price_correction_rejected_after_full_refund(client):
+    make_work(client)
+    make_sale(client, "S1", copies=10)
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 10})
+    assert correct_price(client, "PC1", "S1", 40).status_code == 400
+
+
+def test_refund_creates_reversal_and_original_fields_unchanged(client):
+    """更正后退款：原价/原分成冲回字段不变，另附价差反向流水（独立入账序号）。"""
+    make_work(client)
+    make_sale(client, "S1", copies=1200)
+    correct_price(client, "PC1", "S1", 40)
+    r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 250})
+    assert r.status_code == 201
+    body = r.json()
+    # 原退款字段：200 册@333 + 50 册@267，按原销售版本 v1
+    assert body["split_version"] == 1
+    assert body["total_refund_cents"] == 200 * 333 + 50 * 267
+    assert body["segments"][0]["per_copy_royalty_cents"] == 267
+    # 反向流水：200 册每册 +67、50 册每册 +53（独立流水，序号紧随退款）
+    rev = body["price_delta_reversal"]
+    assert rev["type"] == "price_delta_reversal"
+    assert rev["entry_seq"] == body["entry_seq"] + 1
+    assert rev["sale_id"] == "S1" and rev["split_version"] == 1
+    assert [(g["tier_index"], g["copies"], g["delta_per_copy_cents"])
+            for g in rev["segments"]] == [(0, 50, 53), (1, 200, 67)]
+    assert rev["total_reversal_cents"] == 50 * 53 + 200 * 67
+    # 退款重放返回完全相同的结果（含同一反向流水）
+    r2 = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 250})
+    assert r2.status_code == 200 and r2.json() == body
+
+
+def test_legacy_refund_has_no_reversal(client):
+    """未做过更正的销售，退款不产生反向流水（旧退款不追溯）。"""
+    make_work(client)
+    make_sale(client, "S1", copies=10)
+    body = client.post(
+        "/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 3}
+    ).json()
+    assert body["price_delta_reversal"] is None
+
+
+def test_full_refund_zeroes_correction_per_author(client):
+    """全退后该销售逐作者累计价差（更正 − 反向）归零，含跨档余分错位的极端情形。"""
+    make_work(client)
+    make_sale(client, "S1", copies=1200)  # 1000@267 + 200@333
+    correct_price(client, "PC1", "S1", 40)  # +53 / +67
+    # 退掉 200 册（10% 档）：冲回 200×67
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 200})
+    # 串联第二次更正：剩余 1000 册全在 0 档，40→45，320→360（+40）
+    pc2 = correct_price(client, "PC2", "S1", 45)
+    assert pc2.status_code == 201
+    assert pc2.json()["old_net_price"] == "40"
+    assert pc2.json()["total_delta_cents"] == 1000 * 40
+    # 退满剩余 1000 册：反向流水按望远镜冲回全部累计价差
+    r = client.post("/refunds", json={"refund_id": "R2", "sale_id": "S1", "copies": 1000})
+    rev = r.json()["price_delta_reversal"]
+    corrections = client.get(
+        "/price-corrections", params={"sale_id": "S1"}
+    ).json()["corrections"]
+    corr_by_author: dict[str, int] = {}
+    for pc in corrections:
+        for s in pc["splits"]:
+            corr_by_author[s["author_id"]] = corr_by_author.get(s["author_id"], 0) + s["amount_cents"]
+    # 第一次退款也带有反向流水
+    rev1 = client.get("/refunds/R1").json()["price_delta_reversal"]
+    rev_by_author = {s["author_id"]: s["amount_cents"] for s in rev1["splits"]}
+    for s in rev["splits"]:
+        rev_by_author[s["author_id"]] = rev_by_author.get(s["author_id"], 0) + s["amount_cents"]
+    assert rev_by_author == corr_by_author  # 反向合计 = 更正合计 ⇒ 累计价差归零
+
+
+def test_correction_and_reversal_in_next_close_batch_only(client):
+    """更正与反向作为独立流水进入下一关账批次；历史销售/退款/已关账报表/付款不改写。"""
+    make_work(client)
+    make_sale(client, "S1", copies=1200)
+    c1_id = client.post("/closes", json={"request_id": "C1"}).json()["close_id"]
+    rep1 = client.get(f"/closes/{c1_id}").json()
+    assert rep1["price_corrections_count"] == 0
+
+    correct_price(client, "PC1", "S1", 40)
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 1200})
+    c2 = client.post("/closes", json={"request_id": "C2"}).json()
+    types = [l["type"] for l in c2["lines"]]
+    assert types == ["price_correction", "refund", "price_delta_reversal"]
+    # 全退后作者净额为 0：C2 = 更正 − 退款 − 反向 = −退款 = −原销售（更正与反向抵消）
+    assert c2["author_totals"] == [
+        {"author_id": "A1", "amount_cents": -200160},
+        {"author_id": "A2", "amount_cents": -133440},
+    ]
+    assert c2["price_corrections_count"] == 1
+    assert c2["price_delta_reversals_count"] == 1
+    assert c2["total_price_correction_cents"] == 66400
+    assert c2["total_price_delta_reversal_cents"] == 66400
+    assert c2["total_author_net_cents"] == 66400 - 333600 - 66400
+    # net_royalty_cents 仍仅为销售−退款口径（新增字段不改变既有语义）
+    assert c2["net_royalty_cents"] == -333600
+
+    # 历史销售与第一批报表未被改写
+    s = client.get("/sales/S1").json()
+    assert s["net_price"] == "33.33" and s["total_royalty_cents"] == 333600
+    rep1 = client.get(f"/closes/{c1_id}").json()
+    assert rep1["total_sales_royalty_cents"] == 333600
+    assert rep1["price_corrections_count"] == 0
+    # 全退后作者累计应计为 0，历史付款逻辑不受影响
+    assert client.get("/authors/A1/settlement").json()["accrued_cents"] == 0
+
+
+def test_correction_query_endpoints(client):
+    make_work(client)
+    make_sale(client, "S1", copies=10)
+    make_sale(client, "S2", copies=10)
+    correct_price(client, "PC1", "S1", 40)
+    correct_price(client, "PC2", "S2", 40)
+    # 按更正编号查询
+    r = client.get("/price-corrections/PC1")
+    assert r.status_code == 200 and r.json()["sale_id"] == "S1"
+    assert client.get("/price-corrections/NOPE").status_code == 404
+    # 列表（全部 / 按销售过滤）
+    assert [x["correction_id"] for x in client.get("/price-corrections").json()["corrections"]] == ["PC1", "PC2"]
+    assert [x["correction_id"]
+            for x in client.get("/price-corrections", params={"sale_id": "S2"}).json()["corrections"]] == ["PC2"]
+    assert client.get("/price-corrections", params={"sale_id": "NOPE"}).status_code == 404
+
+
+def test_concurrent_corrections_refunds_and_close(client):
+    """更正/退款/关账并发：按提交顺序判定未退册数与批次，全退后累计价差归零。"""
+    make_work(client, tiers=[{"threshold": 0, "rate": 0.5}])
+    make_sale(client, "S1", copies=100, price="10.00")  # ppc 500，总额 50000
+
+    barrier = threading.Barrier(8)
+
+    def refund(i):
+        barrier.wait()
+        return client.post("/refunds", json={"refund_id": f"R{i}", "sale_id": "S1", "copies": 5})
+
+    def correct(i):
+        barrier.wait()
+        return correct_price(client, f"PC{i}", "S1", 10 + i)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(refund, i) for i in range(10)]  # 10×5 = 50 册
+        futures += [pool.submit(correct, i) for i in range(6)]
+        results = [f.result() for f in futures]
+
+    # 每个编号至多成功一次；其余按提交顺序被拒：已全退（400）或新价等于当前价（409）
+    assert all(r.status_code in (201, 400, 409) for r in results)
+    accepted_corr = [
+        r.json() for r in results
+        if r.status_code == 201 and r.json().get("type") == "price_correction"
+    ]
+
+    # 把剩余 50 册退完后：无论更正与退款如何交错，望远镜恒等式保证逐作者累计价差归零
+    client.post("/refunds", json={"refund_id": "RFINAL", "sale_id": "S1", "copies": 50})
+    report = client.post("/closes").json()
+    # 销售/退款/更正/反向全部在同一批：全退后各作者净额为 0
+    assert report["author_totals"] == [
+        {"author_id": "A1", "amount_cents": 0},
+        {"author_id": "A2", "amount_cents": 0},
+    ]
+    # 累计价差（更正 − 反向）合计为 0
+    corr_total = sum(x["total_delta_cents"] for x in accepted_corr)
+    rev_total = report["total_price_delta_reversal_cents"]
+    refund_total = report["total_refund_cents"]
+    assert corr_total - rev_total == 0  # 全退后累计价差为 0
+    assert refund_total == 50000  # 原价冲回，与更正无关
+    assert report["net_royalty_cents"] == 0
+
+    # 此后该销售已全退，任何新更正均拒绝
+    assert correct_price(client, "PCFINAL", "S1", 99).status_code == 400
+    # 入账序号无重号：本批流水序号严格递增
+    seqs = [l["entry_seq"] for l in report["lines"]]
+    assert seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+
+
+def test_price_correction_uses_original_split_version(client):
+    """更正及反向分账始终按原销售入账版本，与当前分成版本无关。"""
+    make_work(client)  # v1: A1 60 / A2 40
+    make_sale(client, "S1", copies=100)
+    change_split(client, "W1", "CHG-1",
+                 [{"author_id": "A1", "ratio": 70}, {"author_id": "A3", "ratio": 30}])
+    b = correct_price(client, "PC1", "S1", 40).json()
+    assert b["split_version"] == 1
+    assert {s["author_id"] for s in b["splits"]} == {"A1", "A2"}  # 不含 A3
+    r = client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 100}).json()
+    assert r["price_delta_reversal"]["split_version"] == 1
+    assert {s["author_id"] for s in r["price_delta_reversal"]["splits"]} == {"A1", "A2"}
+
+
+def test_migration_accepts_new_entry_kinds(tmp_path):
+    """旧库迁移后 entries 约束接受净价更正与价差反向两种新流水。"""
+    path = tmp_path / "legacy2.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(LEGACY_SCHEMA)
+    conn.execute("INSERT INTO works VALUES('W1','旧作品','fp','2026-01-01T00:00:00+00:00')")
+    conn.execute("INSERT INTO work_tiers VALUES('W1',0,0,'0.08')")
+    conn.execute("INSERT INTO work_authors VALUES('W1','A1','60')")
+    conn.execute("INSERT INTO work_authors VALUES('W1','A2','40')")
+    conn.execute("INSERT INTO entries(kind, ref_id) VALUES('sale','S1')")
+    conn.execute(
+        "INSERT INTO sales(sale_id, work_id, business_time, copies, net_price, entry_seq,"
+        " cum_before, cum_after, total_royalty_cents, close_id, fingerprint, created_at)"
+        " VALUES('S1','W1','2026-01-01T00:00:00',100,'33.33',1,0,100,26700,NULL,'fp',"
+        " '2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute("INSERT INTO sale_segments VALUES('S1',0,0,'0.08',100,267,26700,0)")
+    conn.execute("INSERT INTO sale_splits VALUES('S1','A1',16020)")
+    conn.execute("INSERT INTO sale_splits VALUES('S1','A2',10680)")
+    conn.commit()
+    conn.close()
+
+    db.open_database(str(path))
+    db.init_db()
+    with TestClient(main.app) as client:
+        r = correct_price(client, "PC1", "S1", 40)
+        assert r.status_code == 201  # 新 CHECK 约束已生效
+        # 迁移保留了原销售的入账序号 1，更正取新序号
+        assert r.json()["sale_entry_seq"] == 1 and r.json()["entry_seq"] == 2
+        # 全退：原价冲回 + 价差反向，逐作者归零
+        body = client.post(
+            "/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 100}
+        ).json()
+        assert body["entry_seq"] == 3 and body["price_delta_reversal"]["entry_seq"] == 4
+        report = client.post("/closes").json()
+        assert report["author_totals"] == [
+            {"author_id": "A1", "amount_cents": 0},
+            {"author_id": "A2", "amount_cents": 0},
+        ]

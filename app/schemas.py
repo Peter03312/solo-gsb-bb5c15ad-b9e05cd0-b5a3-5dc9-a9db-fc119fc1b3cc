@@ -96,6 +96,24 @@ class RefundIn(BaseModel):
     copies: int = Field(gt=0)
 
 
+class PriceCorrectionIn(BaseModel):
+    """销售净价更正：凭全局唯一更正编号、原销售编号与非负新每册净价提交。
+
+    - 仅对各档未退册数，按原销售阶梯费率与入账时分成版本计算新旧净价的每册版税差额；
+    - 同更正编号同内容重试返回原结果，异内容拒绝（409，更正编号全局唯一）；
+    - 销售不存在 404、已全退 400、新价等于当前更正价 409。
+    """
+
+    correction_id: str = Field(min_length=1, max_length=128)
+    sale_id: str = Field(min_length=1, max_length=128)
+    new_net_price: Decimal = Field(ge=0, description="更正后每册净价（元，非负）")
+
+    @field_validator("new_net_price", mode="before")
+    @classmethod
+    def _price(cls, v):
+        return _norm_decimal(v)
+
+
 class CloseIn(BaseModel):
     """关账请求。request_id 可选：携带时作为幂等键，同键重试返回原报表。"""
 

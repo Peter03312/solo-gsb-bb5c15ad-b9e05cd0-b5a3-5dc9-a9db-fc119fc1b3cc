@@ -49,10 +49,10 @@ CREATE TABLE IF NOT EXISTS work_version_authors (
     FOREIGN KEY (work_id, version) REFERENCES work_versions(work_id, version)
 );
 
--- 全局入账序号：销售与退款统一排队，决定累计册数与关账批次归属
+-- 全局入账序号：销售、退款、净价更正、价差反向统一排队，决定关账批次归属
 CREATE TABLE IF NOT EXISTS entries (
     entry_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind      TEXT NOT NULL CHECK (kind IN ('sale', 'refund')),
+    kind      TEXT NOT NULL CHECK (kind IN ('sale', 'refund', 'price_correction', 'price_delta_reversal')),
     ref_id    TEXT NOT NULL
 );
 
@@ -156,6 +156,74 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_payments_author ON payments(author_id);
+
+-- 净价更正：以独立流水补提/冲回各档未退册数的新旧净价版税差额，
+-- 不改写历史销售；old_net_price 为该销售的"当前更正价"（首次即原价）
+CREATE TABLE IF NOT EXISTS price_corrections (
+    correction_id       TEXT PRIMARY KEY,
+    sale_id             TEXT NOT NULL REFERENCES sales(sale_id),
+    entry_seq           INTEGER NOT NULL UNIQUE REFERENCES entries(entry_seq),
+    old_net_price       TEXT NOT NULL,
+    new_net_price       TEXT NOT NULL,
+    split_version       INTEGER NOT NULL,  -- 原销售入账时的作者分成版本
+    total_delta_cents   INTEGER NOT NULL,  -- 各档差额合计（可为负）
+    close_id            INTEGER REFERENCES closes(close_id),
+    fingerprint         TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_price_corrections_sale ON price_corrections(sale_id);
+CREATE TABLE IF NOT EXISTS price_correction_segments (
+    correction_id       TEXT NOT NULL REFERENCES price_corrections(correction_id),
+    idx                 INTEGER NOT NULL,
+    sale_segment_idx    INTEGER NOT NULL,
+    tier_idx            INTEGER NOT NULL,
+    rate                TEXT NOT NULL,
+    unrefunded_copies   INTEGER NOT NULL,  -- 更正时该档未退册数
+    old_per_copy_cents  INTEGER NOT NULL,
+    new_per_copy_cents  INTEGER NOT NULL,
+    delta_per_copy_cents INTEGER NOT NULL,  -- 新 - 旧（可为负）
+    amount_cents        INTEGER NOT NULL,  -- 每册差额 × 未退册数（可为负）
+    PRIMARY KEY (correction_id, idx)
+);
+CREATE TABLE IF NOT EXISTS price_correction_splits (
+    correction_id TEXT NOT NULL REFERENCES price_corrections(correction_id),
+    author_id     TEXT NOT NULL,
+    amount_cents  INTEGER NOT NULL,  -- 新价分账 - 旧价分账（可为负）
+    PRIMARY KEY (correction_id, author_id)
+);
+
+-- 退款附带的"已生效价差反向流水"：把被退册数此前已生效的价差冲回，
+-- 与退款同一事务（各占一个入账序号），随退款归入同一关账批次；
+-- 旧退款不追溯，无已生效价差的退款不产生反向流水（无此表行）。
+-- amount_cents 为带符号反向金额：减价差为正、补价差为负，关账时按负贡献入账。
+CREATE TABLE IF NOT EXISTS price_delta_reversals (
+    refund_id           TEXT PRIMARY KEY REFERENCES refunds(refund_id),
+    sale_id             TEXT NOT NULL REFERENCES sales(sale_id),
+    entry_seq           INTEGER NOT NULL UNIQUE REFERENCES entries(entry_seq),
+    split_version       INTEGER NOT NULL,
+    total_reversal_cents INTEGER NOT NULL,
+    close_id            INTEGER REFERENCES closes(close_id),
+    created_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS price_delta_reversal_segments (
+    refund_id           TEXT NOT NULL REFERENCES price_delta_reversals(refund_id),
+    idx                 INTEGER NOT NULL,
+    sale_segment_idx    INTEGER NOT NULL,
+    tier_idx            INTEGER NOT NULL,
+    rate                TEXT NOT NULL,
+    refunded_copies     INTEGER NOT NULL,  -- 本次退款在该档退掉的册数
+    current_per_copy_cents INTEGER NOT NULL,  -- 退款时"当前更正价"下的每册版税
+    original_per_copy_cents INTEGER NOT NULL, -- 原销售原价每册版税
+    delta_per_copy_cents INTEGER NOT NULL,    -- 当前 - 原始（可为负）
+    amount_cents        INTEGER NOT NULL,     -- 每册有效价差 × 被退册数（可为负）
+    PRIMARY KEY (refund_id, idx)
+);
+CREATE TABLE IF NOT EXISTS price_delta_reversal_splits (
+    refund_id    TEXT NOT NULL REFERENCES price_delta_reversals(refund_id),
+    author_id    TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,  -- 带符号反向金额（可为负）
+    PRIMARY KEY (refund_id, author_id)
+);
 """
 
 
@@ -195,13 +263,44 @@ def init_db() -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧库迁移（幂等）：为 sales 补 split_version 列；把旧 work_authors 表迁为版本 1。"""
+    """旧库迁移（幂等）。
+
+    - 为 sales 补 split_version 列；把旧 work_authors 表迁为版本 1；
+    - entries 的 CHECK 约束加入 net 价更正与价差反向两种新流水类型
+      （SQLite 不能直接改 CHECK，按官方推荐方式重建表；在 init_db 持锁、
+      且新表均以 IF NOT EXISTS 创建的前提下，外键引用安全）。
+    """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales)")}
     if "split_version" not in cols:
         # 版本机制之前的销售均按初始分成计提，回填版本 1
         conn.execute(
             "ALTER TABLE sales ADD COLUMN split_version INTEGER NOT NULL DEFAULT 1"
         )
+    # entries CHECK 约束迁移：旧约束只允许 sale/refund，重建为含新流水类型。
+    # 不用 RENAME（SQLite 会连带改写 sales/refunds 等表的外键引用），而是：
+    # 建 entries_new → 拷贝 → DROP entries → RENAME entries_new AS entries，
+    # 引用方始终按名字 "entries" 解析，重建后自然指向新表。
+    entries_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='entries'"
+    ).fetchone()
+    if entries_sql is not None and "price_correction" not in (entries_sql["sql"] or ""):
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute(
+                "CREATE TABLE entries_new ("
+                " entry_seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " kind TEXT NOT NULL CHECK (kind IN"
+                " ('sale','refund','price_correction','price_delta_reversal')),"
+                " ref_id TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO entries_new(entry_seq, kind, ref_id)"
+                " SELECT entry_seq, kind, ref_id FROM entries"
+            )
+            conn.execute("DROP TABLE entries")
+            conn.execute("ALTER TABLE entries_new RENAME TO entries")
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
     has_legacy = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_authors'"
     ).fetchone()
